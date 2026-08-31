@@ -723,12 +723,51 @@ function portIsSP1(p) {
 // the open attempt be the arbiter.
 function portLive(p) { return p.connected !== false; }
 
+
+const GRANT_KEY = "sp1flasher.grantedPort";
+const seenPorts = new Set();
+
+function grantRecord() {
+  try { return JSON.parse(localStorage.getItem(GRANT_KEY) || "null"); }
+  catch (e) { return null; }
+}
+function rememberGrant(info) {
+  try {
+    localStorage.setItem(GRANT_KEY, JSON.stringify({
+      vid: (info && info.usbVendorId) || TE_VID,
+      pid: (info && info.usbProductId) || 0,
+      ts: Date.now(),
+    }));
+  } catch (e) { /* file:// or private mode — the note just falls back to getPorts() */ }
+}
+function forgetGrant() {
+  seenPorts.clear();
+  try { localStorage.removeItem(GRANT_KEY); } catch (e) {}
+}
+/* Record a port we have been handed (grant dialog, connect event, poll). */
+function noteSeenPort(p) {
+  if (!p || !portIsSP1(p)) return false;
+  seenPorts.add(p);
+  try { rememberGrant(p.getInfo()); } catch (e) { rememberGrant(null); }
+  return true;
+}
+
 async function permittedSP1Ports() {
-  const ps = await navigator.serial.getPorts();
-  return ps.filter(portIsSP1);
+  let ps = [];
+  try { ps = await navigator.serial.getPorts(); } catch (e) { ps = []; }
+  const out = ps.filter(portIsSP1);
+  out.forEach(noteSeenPort);
+  for (const p of seenPorts) if (out.indexOf(p) === -1) out.push(p);
+  return out;
 }
 async function livePresentSP1Ports() {
-  return (await permittedSP1Ports()).filter(portLive);
+  let ps = [];
+  try { ps = await navigator.serial.getPorts(); } catch (e) { ps = []; }
+  const out = ps.filter((p) => portIsSP1(p) && portLive(p));
+  // A port we only know from a connect event counts as present only when the
+  // browser positively says so, so a stale entry can never block arming.
+  for (const p of seenPorts) if (p.connected === true && out.indexOf(p) === -1) out.push(p);
+  return out;
 }
 
 let watcher = null;
@@ -754,7 +793,7 @@ function waitForDevice(timeoutMs, onTick) {
     const finish = (port) => { if (w.stopped) return; w.resolve = null; stopWatch(); resolve(port); };
     w.onConnect = (e) => {
       const p = (e && (e.port || e.target)) || null;
-      if (p && portIsSP1(p)) finish(p);
+      if (p && noteSeenPort(p)) finish(p);
     };
     const poll = async () => {
       if (w.stopped) return;
@@ -903,20 +942,27 @@ async function loadImage(file) {
 async function refreshDeviceNote() {
   if (!("serial" in navigator)) return;
   const ps = await permittedSP1Ports();
-  const live = ps.filter(portLive);
+  const live = await livePresentSP1Ports();
+  const grant = grantRecord();
+  const known = ps.length > 0 || !!grant;
   const note = $("deviceNote");
-  $("btnForget").classList.toggle("hidden", ps.length === 0);
-  $("stepDevice").dataset.done = ps.length ? "1" : "0";
-  if (ps.length === 0) {
+  $("btnForget").classList.toggle("hidden", !known);
+  $("stepDevice").dataset.done = known ? "1" : "0";
+  if (live.length) {
+    note.innerHTML = '<span class="warn">SP-1 bootloader port granted and ' +
+      "<strong>connected right now</strong> — its ~" + WINDOW_S + " s window is already running.</span>";
+  } else if (ps.length) {
+    note.innerHTML = '<span class="ok">' + ps.length + " SP-1 bootloader port remembered</span> " +
+      "(not connected). You can arm before plugging in.";
+  } else if (grant) {
+    note.innerHTML = '<span class="ok">SP-1 bootloader access granted</span> ' +
+      "(not connected" + (grant.ts ? ", last seen " + new Date(grant.ts).toLocaleString() : "") + "). " +
+      "Chrome does not list a granted port while the device is unplugged, so this is remembered here " +
+      "instead — arm now and plug in, the flash starts on the plug-in itself.";
+  } else {
     note.innerHTML = "No SP-1 remembered yet. Put the device in <strong>bootloader mode</strong> " +
       "(reboot into it from the REPL, or hold Track&nbsp;1 + Track&nbsp;4 while plugging USB in), " +
       "then grant access once. After that the browser remembers it and you can arm with nothing plugged in.";
-  } else if (live.length) {
-    note.innerHTML = '<span class="warn">' + ps.length + " SP-1 bootloader port remembered and " +
-      "<strong>connected right now</strong> — its ~67 s window is already running.</span>";
-  } else {
-    note.innerHTML = '<span class="ok">' + ps.length + " SP-1 bootloader port remembered</span> " +
-      "(not connected). You can arm before plugging in.";
   }
 }
 
@@ -1059,6 +1105,7 @@ $("btnGrant").addEventListener("click", async () => {
   try {
     const p = await navigator.serial.requestPort({ filters: [{ usbVendorId: TE_VID }] });
     const i = p.getInfo();
+    noteSeenPort(p);
     log("granted access to " + hex(i.usbVendorId, 4) + ":" + hex(i.usbProductId || 0, 4), "ok");
   } catch (e) {
     if (e && e.name === "NotFoundError") {
@@ -1074,7 +1121,11 @@ $("btnGrant").addEventListener("click", async () => {
 
 $("btnForget").addEventListener("click", async () => {
   const ps = await permittedSP1Ports();
-  for (const p of ps) { try { await p.forget(); } catch (e) { log("forget failed: " + e.message, "warn"); } }
+  for (const p of ps) {
+    try { if (p.forget) await p.forget(); }
+    catch (e) { log("forget failed: " + e.message, "warn"); }
+  }
+  forgetGrant();
   log("forgot " + ps.length + " remembered port(s).", "dim");
   refreshDeviceNote();
 });
@@ -1107,10 +1158,24 @@ $("btnClearLog").addEventListener("click", () => { $("log").textContent = ""; })
   if (imageFile && !flashing && !armed) loadImage(imageFile);   // re-render the plan and ETA
 }));
 
+navigator.serial && navigator.serial.addEventListener("connect", (e) => {
+  const p = (e && (e.port || e.target)) || null;
+  if (p && noteSeenPort(p)) { log("an SP-1 bootloader port appeared.", "dim"); refreshDeviceNote(); }
+});
 navigator.serial && navigator.serial.addEventListener("disconnect", (e) => {
   const p = (e && (e.port || e.target)) || null;
-  if (p && portIsSP1(p)) { log("the SP-1 bootloader port went away.", "dim"); refreshDeviceNote(); }
+  if (p && portIsSP1(p)) {
+    seenPorts.delete(p);
+    log("the SP-1 bootloader port went away.", "dim");
+    refreshDeviceNote();
+  }
 });
+// getPorts() and `connected` can both change while the tab is in the
+// background (a reset, a replug); re-read them when it comes back.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !flashing) refreshDeviceNote();
+});
+window.addEventListener("focus", () => { if (!flashing) refreshDeviceNote(); });
 
 window.addEventListener("beforeunload", (e) => {
   if (flashing) { e.preventDefault(); e.returnValue = ""; }
